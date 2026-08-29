@@ -528,6 +528,14 @@ def update(
                 symbol="info",
             )
 
+    # #2334: refuse before any resolution or write when this CLI predates the
+    # lockfile's generator. Placed after the self-update shims above, which
+    # return early and never touch the lockfile.
+    from apm_cli.deps.lockfile import get_lockfile_path as _get_lockfile_path
+    from apm_cli.deps.lockfile_guard import enforce_or_exit as _enforce_lockfile_generator
+
+    _enforce_lockfile_generator(_get_lockfile_path(project_root), error=_rich_error)
+
     _run_dep_update(
         assume_yes=assume_yes,
         dry_run=dry_run,

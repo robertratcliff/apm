@@ -107,6 +107,14 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
             logger.error("No packages specified. Specify packages to uninstall.")
             sys.exit(1)
 
+        # #2334: refuse before announcing or removing anything when this CLI
+        # predates the lockfile's generator.
+        from ...deps.lockfile import get_lockfile_path
+        from ...deps.lockfile_guard import enforce_or_exit as _enforce_lockfile_generator
+
+        lockfile_path = get_lockfile_path(apm_dir)
+        _enforce_lockfile_generator(lockfile_path, error=logger.error)
+
         if scope is InstallScope.USER:
             logger.progress("Uninstalling from user scope (~/.apm/)")
 
@@ -131,9 +139,8 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
 
         # Load lockfile early: used for marketplace ref resolution in Step 1
         # and reused for MCP state capture and transitive orphan cleanup below.
-        from ...deps.lockfile import LockFile, get_lockfile_path
+        from ...deps.lockfile import LockFile
 
-        lockfile_path = get_lockfile_path(apm_dir)
         lockfile = LockFile.read(lockfile_path)
 
         # Step 1: Validate packages

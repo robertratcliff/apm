@@ -211,6 +211,13 @@ def _run_lock(
     if project_root != Path.cwd().resolve():
         os.chdir(project_root)
 
+    # #2334: refuse before resolving anything when this CLI predates the
+    # lockfile's generator.
+    from apm_cli.deps.lockfile import get_lockfile_path as _get_lockfile_path
+    from apm_cli.deps.lockfile_guard import enforce_or_exit as _enforce_lockfile_generator
+
+    _enforce_lockfile_generator(_get_lockfile_path(project_root), error=_rich_error)
+
     try:
         apm_package = APMPackage.from_apm_yml(Path("apm.yml"))
     except (FileNotFoundError, ValueError) as e:

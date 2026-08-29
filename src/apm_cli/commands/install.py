@@ -1429,6 +1429,15 @@ def install(  # noqa: C901, PLR0913
         # Scope-aware paths
         manifest_path = get_manifest_path(scope)
         apm_dir = get_apm_dir(scope)
+
+        # #2334: a CLI older than the lockfile's generator must not rewrite it.
+        # Checked here, before any download, deployment, or manifest write, so a
+        # refusal leaves the project byte-for-byte unchanged.
+        from ..deps.lockfile import get_lockfile_path as _get_lockfile_path
+        from ..deps.lockfile_guard import enforce_or_exit as _enforce_lockfile_generator
+
+        _enforce_lockfile_generator(_get_lockfile_path(apm_dir), error=logger.error)
+
         # Display name for messages (short for project scope, full for user scope)
         manifest_display = str(manifest_path) if scope is InstallScope.USER else APM_YML_FILENAME
 
