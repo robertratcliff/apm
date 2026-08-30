@@ -36,6 +36,36 @@ from apm_cli.deps.lockfile_guard import (
 # which has fallbacks that ``installed_apm_version`` lacks (see #2334 review).
 _RUNNING_VERSION_SEAM = "apm_cli.deps.lockfile_guard.running_cli_version"
 
+
+@pytest.fixture(autouse=True)
+def _reset_console_state():
+    """Reset the APM and Rich console singletons around every test here.
+
+    This module drives whole commands through ``CliRunner``, and one of them
+    -- ``apm lock export --format cyclonedx`` -- is a machine-readable mode,
+    so it calls ``set_console_stderr(True)``. That sets a MODULE-LEVEL global
+    in ``apm_cli.utils.console`` and rebuilds the console singleton against
+    stderr. Left set, every later test in the same worker process sees empty
+    stdout, and the failure surfaces somewhere else entirely.
+
+    ``tests/integration/conftest.py`` carries the same fixture for the same
+    reason (its docstring cites ``pack --json``); it does not reach
+    ``tests/unit``, so this module brings its own. Without it the suite still
+    passes in full-file order but fails under any partial selection, which is
+    exactly the shape CI runs: ``-n auto --dist worksteal`` plus pytest-split
+    sharding, where which tests share a process varies per run.
+    """
+    import rich
+
+    from apm_cli.utils.console import _reset_console
+
+    _reset_console()
+    rich._console = None
+    yield
+    _reset_console()
+    rich._console = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -195,6 +225,99 @@ class TestRecordedGenerator:
         path = _write_lockfile(tmp_path, "0.25.0")
         path.write_text(
             path.read_text(encoding="utf-8") + "dependencies:\n  pkg:\n    apm_version: 0.1.0\n",
+            encoding="utf-8",
+        )
+        assert read_recorded_generator(path) == "0.25.0"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            'lockfile_version: "1"\n"apm_version": 0.25.0\ndependencies: {}\n',
+            "lockfile_version: \"1\"\n'apm_version': 0.25.0\ndependencies: {}\n",
+            '﻿lockfile_version: "1"\napm_version: 0.25.0\ndependencies: {}\n',
+            'lockfile_version: "1"\napm_version: "0.25.0"\ndependencies: {}\n',
+            'lockfile_version: "1"\napm_version:   0.25.0\ndependencies: {}\n',
+        ],
+        ids=[
+            "double-quoted-key",
+            "single-quoted-key",
+            "bom-prefixed-file",
+            "quoted-value",
+            "padded-value",
+        ],
+    )
+    def test_alternate_spellings_of_the_key_are_the_same_field(
+        self, tmp_path: Path, text: str
+    ) -> None:
+        """Regression: a text-level key match failed OPEN on every other spelling.
+
+        Reading the field from the raw file text recognised only a bare
+        ``apm_version:`` at column 0, so a quoted key -- valid YAML that
+        ``yaml.safe_load`` reads identically -- made the guard skip the file
+        entirely and let a stale CLI through.
+        """
+        path = tmp_path / "apm.lock.yaml"
+        path.write_text(text, encoding="utf-8")
+        assert read_recorded_generator(path) == "0.25.0"
+
+    def test_quoted_key_still_stops_a_stale_cli(self, tmp_path: Path) -> None:
+        """The end-to-end shape of the bypass above: refusal, not silent pass."""
+        path = tmp_path / "apm.lock.yaml"
+        path.write_text(
+            'lockfile_version: "1"\n"apm_version": 0.25.0\ndependencies: {}\n', encoding="utf-8"
+        )
+        with pytest.raises(StaleCliError):
+            require_compatible_lockfile_generator(path, running_version="0.24.0")
+
+    def test_duplicate_keys_are_unsafe_whatever_their_spelling(self, tmp_path: Path) -> None:
+        path = tmp_path / "apm.lock.yaml"
+        path.write_text(
+            'lockfile_version: "1"\napm_version: 0.25.0\n"apm_version": 0.24.0\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(UnsafeGeneratorMetadataError, match="2 times"):
+            read_recorded_generator(path)
+
+    def test_scalar_is_read_verbatim_not_via_the_float_resolver(self, tmp_path: Path) -> None:
+        """``1.10`` is a version, not the number 1.1.
+
+        Constructing the value would hand back a float and stringify it back
+        to ``1.1``, comparing a CLI against a generator the lockfile does not
+        name.
+        """
+        path = tmp_path / "apm.lock.yaml"
+        path.write_text(
+            'lockfile_version: "1"\napm_version: 1.10\ndependencies: {}\n', encoding="utf-8"
+        )
+        assert read_recorded_generator(path) == "1.10"
+
+    def test_non_scalar_generator_is_unsafe(self, tmp_path: Path) -> None:
+        path = tmp_path / "apm.lock.yaml"
+        path.write_text(
+            'lockfile_version: "1"\napm_version:\n  - 0.25.0\ndependencies: {}\n', encoding="utf-8"
+        )
+        with pytest.raises(UnsafeGeneratorMetadataError, match="not a single value"):
+            read_recorded_generator(path)
+
+    def test_top_level_merge_key_without_an_explicit_version_is_unsafe(
+        self, tmp_path: Path
+    ) -> None:
+        """An unexpanded ``<<`` could contribute a generator we cannot see."""
+        path = tmp_path / "apm.lock.yaml"
+        path.write_text(
+            "base: &base\n  apm_version: 0.25.0\n"
+            'lockfile_version: "1"\n<<: *base\ndependencies: {}\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(UnsafeGeneratorMetadataError, match="merges an anchor"):
+            read_recorded_generator(path)
+
+    def test_explicit_version_wins_over_a_merge_key(self, tmp_path: Path) -> None:
+        """An explicit key overrides a merged one in YAML, so it is knowable."""
+        path = tmp_path / "apm.lock.yaml"
+        path.write_text(
+            "base: &base\n  apm_version: 0.24.0\n"
+            'lockfile_version: "1"\n<<: *base\napm_version: 0.25.0\ndependencies: {}\n',
             encoding="utf-8",
         )
         assert read_recorded_generator(path) == "0.25.0"
@@ -452,3 +575,24 @@ class TestReadOnlyCommandsAreNotGuarded:
         result = CliRunner().invoke(cli, argv)
 
         assert "Refusing to rewrite" not in result.output
+
+
+class TestConsoleStateDoesNotLeak:
+    """Guards the ``_reset_console_state`` fixture at the top of this module.
+
+    Declared last so it runs after ``TestReadOnlyCommandsAreNotGuarded``, whose
+    ``lock export`` case is what sets the global. Delete the fixture and these
+    fail here, rather than an unrelated test failing in another file.
+    """
+
+    def test_machine_readable_command_left_no_stderr_routing_behind(self) -> None:
+        from apm_cli.utils import console
+
+        assert console._console_stderr is False
+
+    def test_rich_output_still_reaches_stdout(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from apm_cli.utils.console import _rich_echo
+
+        _rich_echo("guard fixture check")
+
+        assert "guard fixture check" in capsys.readouterr().out

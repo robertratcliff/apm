@@ -83,9 +83,17 @@ _PRE_DEV_OF_FINAL_RANK = -1
 _DEV_PRESENT = 0
 _DEV_ABSENT = 1
 
-# Only a key at column 0 is the top-level generator field.  Anything indented
-# belongs to a nested mapping and is not the field this guard governs.
-_TOP_LEVEL_APM_VERSION_RE = re.compile(r"^apm_version[ \t]*:", re.MULTILINE)
+# Tags and key name used when walking the composed YAML node tree.  The field
+# is read from the node tree rather than from the raw file text: a text-level
+# match recognises exactly one spelling of the key and silently disables the
+# guard on every other valid one (``"apm_version":`` quoted, a BOM-prefixed
+# file), which fails OPEN -- the single direction #2334 asks the guard never
+# to fail in.  The node tree also preserves the scalar verbatim, so a value
+# like ``1.10`` is compared as written instead of being coerced to ``1.1`` by
+# YAML's float resolver.
+_YAML_STR_TAG = "tag:yaml.org,2002:str"
+_YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
+_GENERATOR_KEY = "apm_version"
 
 VersionKey = tuple[int, int, int, int, int, int, int, int]
 
@@ -212,38 +220,66 @@ def read_recorded_generator(lockfile_path: Path) -> str | None:
 
     Returns ``None`` when there is no lockfile, when it predates the
     ``apm_version`` field, or when it is unreadable -- none of which are this
-    guard's failure to report.  Raises
-    :class:`UnsafeGeneratorMetadataError` when the field is declared more than
-    once, since YAML would silently resolve the duplicate to the last value
-    and the file's true generator would be unknowable.
+    guard's failure to report.
+
+    The field is located in the composed YAML node tree, so every valid
+    spelling of the key resolves to the same field and only a key in the
+    top-level mapping is considered; a nested ``apm_version`` still belongs to
+    someone else's mapping and is ignored.  Raises
+    :class:`UnsafeGeneratorMetadataError` when the file cannot be reduced to a
+    single knowable generator: the key declared more than once (YAML would
+    silently resolve the duplicate to the last value), a non-scalar value, or
+    a top-level merge key that could contribute a generator this function does
+    not expand.
     """
     try:
         text = lockfile_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
 
-    occurrences = len(_TOP_LEVEL_APM_VERSION_RE.findall(text))
-    if occurrences > 1:
-        raise UnsafeGeneratorMetadataError(
-            f"apm.lock.yaml declares a top-level apm_version {occurrences} times"
-        )
-    if occurrences == 0:
-        return None
-
     import yaml
 
     try:
-        data = yaml.safe_load(text)
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
     except yaml.YAMLError:
         # A lockfile that will not parse is the schema layer's failure to
         # report, not this guard's.
         return None
-    if not isinstance(data, dict):
+    if not isinstance(root, yaml.MappingNode):
         return None
-    recorded = data.get("apm_version")
-    if recorded is None:
+
+    recorded_nodes = [
+        value_node
+        for key_node, value_node in root.value
+        if isinstance(key_node, yaml.ScalarNode)
+        and key_node.tag == _YAML_STR_TAG
+        and key_node.value == _GENERATOR_KEY
+    ]
+    if len(recorded_nodes) > 1:
+        raise UnsafeGeneratorMetadataError(
+            f"apm.lock.yaml declares a top-level apm_version {len(recorded_nodes)} times"
+        )
+    if not recorded_nodes:
+        # An explicit key wins over anything a merge key would contribute, so
+        # this is the only case where an unexpanded ``<<`` can hide a
+        # generator. Refuse rather than proceed: an unreadable generator is
+        # exactly what UnsafeGeneratorMetadataError exists to report.
+        if any(
+            isinstance(key_node, yaml.ScalarNode) and key_node.tag == _YAML_MERGE_TAG
+            for key_node, _ in root.value
+        ):
+            raise UnsafeGeneratorMetadataError(
+                "apm.lock.yaml merges an anchor into its top-level mapping, which may "
+                "contribute an apm_version that cannot be read directly"
+            )
         return None
-    return str(recorded)
+
+    recorded = recorded_nodes[0]
+    if not isinstance(recorded, yaml.ScalarNode):
+        raise UnsafeGeneratorMetadataError(
+            "apm.lock.yaml records a top-level apm_version that is not a single value"
+        )
+    return recorded.value
 
 
 def require_compatible_lockfile_generator(
