@@ -6,11 +6,16 @@ Structured around the issue's acceptance evidence:
 * equal and newer CLIs continue normally;
 * stable/prerelease ordering is covered;
 * the rejected command leaves the lockfile byte-for-byte unchanged;
-* the guard covers every mutating path, not only ``install``.
+* the guard covers every mutating path, not only ``install`` -- including the
+  two branches of ``install`` that return before the main pipeline
+  (``--mcp`` and a local bundle);
+* a build that cannot introspect its own version warns instead of blocking;
+* ``--dry-run`` warns instead of refusing, because it writes nothing.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -19,11 +24,17 @@ from click.testing import CliRunner
 
 from apm_cli.deps.lockfile_guard import (
     StaleCliError,
+    UndeterminableRunningVersionError,
     UnsafeGeneratorMetadataError,
     parse_version,
     read_recorded_generator,
     require_compatible_lockfile_generator,
 )
+
+# The single seam that reports the running CLI's version. Patch this rather
+# than ``installed_apm_version``: the guard prefers ``version.get_version()``,
+# which has fallbacks that ``installed_apm_version`` lacks (see #2334 review).
+_RUNNING_VERSION_SEAM = "apm_cli.deps.lockfile_guard.running_cli_version"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -57,7 +68,27 @@ def _write_project(directory: Path, apm_version: str | None) -> Path:
         "includes: auto\nscripts: {}\n",
         encoding="utf-8",
     )
+    _write_local_bundle(directory / "bundle")
     return _write_lockfile(directory, apm_version)
+
+
+def _write_local_bundle(bundle_dir: Path) -> Path:
+    """Write a minimal local bundle -- a directory with a ``plugin.json`` root.
+
+    ``apm install <this>`` takes the local-bundle branch, which returns before
+    the main install pipeline and writes the lockfile of its own accord.
+    """
+    skill = bundle_dir / "skills" / "bundled"
+    skill.mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: bundled\ndescription: Bundle fixture skill for the #2334 guard.\n---\n\n# B\n",
+        encoding="utf-8",
+    )
+    (bundle_dir / "plugin.json").write_text(
+        json.dumps({"name": "guard-bundle", "version": "0.1.0", "description": "Bundle fixture"}),
+        encoding="utf-8",
+    )
+    return bundle_dir
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +122,44 @@ class TestVersionOrdering:
         assert parse_version("0.25.0+build.7") == parse_version("0.25.0")
         assert parse_version("0.25.0rc1+abc") == parse_version("0.25.0rc1")
 
+    def test_pep440_dev_and_post_order_around_the_release(self) -> None:
+        """An editable/source build must not be mistaken for an unknown version.
+
+        ``.devN`` precedes the release it builds toward; ``.postN`` follows it.
+        Before this was supported, either form fell out of the grammar and was
+        treated as unsafe metadata.
+        """
+        ascending = [
+            "0.25.0.dev1",
+            "0.25.0.dev2",
+            "0.25.0a1.dev1",
+            "0.25.0a1",
+            "0.25.0rc1",
+            "0.25.0",
+            "0.25.0.post1",
+            "0.25.1",
+        ]
+        keys = [parse_version(v) for v in ascending]
+        assert all(k is not None for k in keys)
+        assert all(keys[i] < keys[i + 1] for i in range(len(keys) - 1))
+
+    @pytest.mark.parametrize(
+        ("alias", "canonical"),
+        [
+            ("0.25.0alpha1", "0.25.0a1"),
+            ("0.25.0beta2", "0.25.0b2"),
+            ("0.25.0c3", "0.25.0rc3"),
+            ("0.25.0-rc1", "0.25.0rc1"),
+            ("0.25.0.rc1", "0.25.0rc1"),
+            ("0.25.0_rc1", "0.25.0rc1"),
+        ],
+    )
+    def test_pep440_spelling_aliases_are_equivalent(self, alias: str, canonical: str) -> None:
+        assert parse_version(alias) == parse_version(canonical)
+
     @pytest.mark.parametrize(
         "raw",
-        ["0.0.0-test", "test", "unknown", "", "1.2", "v1.2.3", "1.2.3.4", None, 3],
+        ["0.0.0-test", "test", "unknown", "", "1.2", "v1.2.3", "1.2.3.4", "1!2.0.0", None, 3],
     )
     def test_unparseable_values_return_none(self, raw: object) -> None:
         assert parse_version(raw) is None
@@ -185,11 +251,40 @@ class TestGuard:
         with pytest.raises(UnsafeGeneratorMetadataError, match="unrecognizable"):
             require_compatible_lockfile_generator(path, running_version="0.24.0")
 
-    def test_undeterminable_running_version_is_unsafe(self, tmp_path: Path) -> None:
-        """We cannot prove this CLI is not the older one, so we refuse."""
+    def test_undeterminable_running_version_is_advisory_not_fatal(self, tmp_path: Path) -> None:
+        """A build that cannot introspect its version must not brick the project.
+
+        PyInstaller binaries ship no distribution metadata, so
+        ``installed_apm_version()`` reports ``unknown`` there. Treating that as
+        a hard refusal blocked every mutating command for binary users working
+        in a repo whose lockfile a pip-installed colleague generated -- a worse
+        regression than the one this guard prevents. It is raised as its own
+        advisory type, which ``enforce_or_exit`` renders as a warning.
+        """
         path = _write_lockfile(tmp_path, "0.25.0")
-        with pytest.raises(UnsafeGeneratorMetadataError, match="cannot"):
+        with pytest.raises(UndeterminableRunningVersionError) as excinfo:
             require_compatible_lockfile_generator(path, running_version="unknown")
+        assert not isinstance(excinfo.value, UnsafeGeneratorMetadataError)
+        assert excinfo.value.recorded == "0.25.0"
+
+    def test_running_version_prefers_get_version_over_dist_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``version.get_version()`` has fallbacks ``installed_apm_version`` lacks."""
+        from apm_cli.deps import lockfile_guard
+
+        monkeypatch.setattr("apm_cli.version.get_version", lambda: "0.31.0")
+        monkeypatch.setattr("apm_cli.deps.lockfile.installed_apm_version", lambda: "unknown")
+        assert lockfile_guard.running_cli_version() == "0.31.0"
+
+    def test_running_version_falls_back_when_get_version_is_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from apm_cli.deps import lockfile_guard
+
+        monkeypatch.setattr("apm_cli.version.get_version", lambda: "unknown")
+        monkeypatch.setattr("apm_cli.deps.lockfile.installed_apm_version", lambda: "0.30.0")
+        assert lockfile_guard.running_cli_version() == "0.30.0"
 
     def test_refusal_is_not_a_lockfile_format_error(self, tmp_path: Path) -> None:
         """Acceptance: CLI-compatibility failures stay distinct from schema ones."""
@@ -205,35 +300,58 @@ class TestGuard:
 # Every mutating path (acceptance: not only ``install``)
 # ---------------------------------------------------------------------------
 
-# Commands that can persist apm.lock.yaml, with arguments sufficient to reach
-# the guard. Read-only commands (audit, outdated, deps, doctor, view, ...) are
-# deliberately absent: the guard must not block them.
+# Invocations that can persist apm.lock.yaml, with arguments sufficient to
+# reach the guard. Read-only commands are deliberately absent -- see
+# ``TestReadOnlyCommandsAreNotGuarded``, which pins that they stay unblocked.
+#
+# ``install --mcp`` and ``install <bundle>`` are the two branches of
+# ``install`` that return before the main pipeline yet still write the
+# lockfile. They are listed explicitly because guarding only the main pipeline
+# left both able to rewrite a newer lockfile silently.
 MUTATING_INVOCATIONS = [
     ("install", ["--no-policy"]),
-    ("update", ["--yes"]),
-    ("uninstall", ["./skills/example"]),
-    ("prune", []),
-    ("lock", []),
+    (
+        "install --mcp",
+        ["install", "--mcp", "guarded", "--transport", "http", "--url", "https://example.test/mcp"],
+    ),
+    ("install <bundle>", ["install", "./bundle", "--no-policy"]),
+    ("update", ["update", "--yes"]),
+    ("uninstall", ["uninstall", "./skills/example"]),
+    ("prune", ["prune"]),
+    ("lock", ["lock"]),
+]
+
+# Normalised to full argv so the ids above can describe a flag combination
+# rather than only a command name.
+MUTATING_ARGV = [
+    (name, argv if name != "install" else ["install", "--no-policy"])
+    for name, argv in MUTATING_INVOCATIONS
+]
+
+# Every mutating invocation that also accepts --dry-run.
+DRY_RUN_ARGV = [
+    ("install", ["install", "--dry-run", "--no-policy"]),
+    ("update", ["update", "--yes", "--dry-run"]),
+    ("uninstall", ["uninstall", "./skills/example", "--dry-run"]),
+    ("prune", ["prune", "--dry-run"]),
 ]
 
 
 class TestEveryMutatingCommandIsGuarded:
     @pytest.mark.parametrize(
-        ("command", "args"),
-        MUTATING_INVOCATIONS,
-        ids=[name for name, _ in MUTATING_INVOCATIONS],
+        ("name", "argv"), MUTATING_ARGV, ids=[name for name, _ in MUTATING_ARGV]
     )
     def test_mutating_command_refuses_and_leaves_lockfile_untouched(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, args: list[str]
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, argv: list[str]
     ) -> None:
         from apm_cli.cli import cli
 
         monkeypatch.chdir(tmp_path)
         lockfile = _write_project(tmp_path, "0.25.0")
-        monkeypatch.setattr("apm_cli.deps.lockfile.installed_apm_version", lambda: "0.24.0")
+        monkeypatch.setattr(_RUNNING_VERSION_SEAM, lambda: "0.24.0")
         before = lockfile.read_bytes()
 
-        result = CliRunner().invoke(cli, [command, *args])
+        result = CliRunner().invoke(cli, argv)
 
         assert result.exit_code != 0, result.output
         assert "0.25.0" in result.output and "0.24.0" in result.output
@@ -242,12 +360,10 @@ class TestEveryMutatingCommandIsGuarded:
         assert lockfile.read_bytes() == before
 
     @pytest.mark.parametrize(
-        ("command", "args"),
-        MUTATING_INVOCATIONS,
-        ids=[name for name, _ in MUTATING_INVOCATIONS],
+        ("name", "argv"), MUTATING_ARGV, ids=[name for name, _ in MUTATING_ARGV]
     )
     def test_mutating_command_proceeds_past_guard_when_cli_is_newer(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, args: list[str]
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, argv: list[str]
     ) -> None:
         """A newer CLI must not be stopped by the guard.
 
@@ -258,8 +374,81 @@ class TestEveryMutatingCommandIsGuarded:
 
         monkeypatch.chdir(tmp_path)
         _write_project(tmp_path, "0.25.0")
-        monkeypatch.setattr("apm_cli.deps.lockfile.installed_apm_version", lambda: "0.26.0")
+        monkeypatch.setattr(_RUNNING_VERSION_SEAM, lambda: "0.26.0")
 
-        result = CliRunner().invoke(cli, [command, *args])
+        result = CliRunner().invoke(cli, argv)
+
+        assert "Refusing to rewrite" not in result.output
+
+    @pytest.mark.parametrize(
+        ("name", "argv"), MUTATING_ARGV, ids=[name for name, _ in MUTATING_ARGV]
+    )
+    def test_undeterminable_running_version_warns_but_does_not_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, argv: list[str]
+    ) -> None:
+        """A frozen binary reporting ``unknown`` must not be locked out.
+
+        Regression test for the fix to #2334's first cut, which turned an
+        unintrospectable running version into a hard exit on every mutating
+        command.
+        """
+        from apm_cli.cli import cli
+
+        monkeypatch.chdir(tmp_path)
+        _write_project(tmp_path, "0.25.0")
+        monkeypatch.setattr(_RUNNING_VERSION_SEAM, lambda: "unknown")
+
+        result = CliRunner().invoke(cli, argv)
+
+        assert "Refusing to rewrite" not in result.output
+        assert "Repair or remove" not in result.output
+
+
+class TestDryRunWarnsInsteadOfRefusing:
+    @pytest.mark.parametrize(("name", "argv"), DRY_RUN_ARGV, ids=[name for name, _ in DRY_RUN_ARGV])
+    def test_dry_run_continues_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, argv: list[str]
+    ) -> None:
+        """--dry-run is the diagnostic a blocked user reaches for.
+
+        It writes nothing, so refusing it removes the one way to find out what
+        the real command would do, for no protective benefit.
+        """
+        from apm_cli.cli import cli
+
+        monkeypatch.chdir(tmp_path)
+        lockfile = _write_project(tmp_path, "0.25.0")
+        monkeypatch.setattr(_RUNNING_VERSION_SEAM, lambda: "0.24.0")
+        before = lockfile.read_bytes()
+
+        result = CliRunner().invoke(cli, argv)
+
+        assert "--dry-run writes nothing" in result.output
+        assert lockfile.read_bytes() == before
+
+
+class TestReadOnlyCommandsAreNotGuarded:
+    """The guard must never block a command that cannot write the lockfile."""
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["audit"],
+            ["outdated"],
+            ["list"],
+            ["lock", "export", "--format", "cyclonedx"],
+        ],
+        ids=["audit", "outdated", "list", "lock-export"],
+    )
+    def test_read_only_command_is_unaffected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+    ) -> None:
+        from apm_cli.cli import cli
+
+        monkeypatch.chdir(tmp_path)
+        _write_project(tmp_path, "0.25.0")
+        monkeypatch.setattr(_RUNNING_VERSION_SEAM, lambda: "0.24.0")
+
+        result = CliRunner().invoke(cli, argv)
 
         assert "Refusing to rewrite" not in result.output

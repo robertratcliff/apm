@@ -721,6 +721,35 @@ def _validate_and_add_packages_to_apm_yml(
 # ---------------------------------------------------------------------------
 
 
+def _guard_lockfile_generator(*, global_: bool, dry_run: bool, logger) -> None:
+    """Refuse (or warn) when this CLI predates the lockfile's generator (#2334).
+
+    Must be called BEFORE the local-bundle and ``--mcp`` branches of
+    :func:`install`. Both of those ``return`` without reaching the main install
+    pipeline, and both write ``apm.lock.yaml`` -- via
+    ``install.local_bundle_handler`` and ``MCPIntegrator.update_lockfile``
+    respectively -- so a guard placed after them leaves
+    ``apm install <bundle>`` and ``apm install --mcp`` (plus its
+    ``apm mcp install`` alias) able to rewrite a newer lockfile silently, which
+    is the exact defect #2334 reports.
+
+    Runs before any download, deployment, or manifest write, so a refusal
+    leaves the project byte-for-byte unchanged. ``--dry-run`` writes nothing,
+    so it warns and continues instead of refusing.
+    """
+    from ..core.scope import InstallScope, get_apm_dir
+    from ..deps.lockfile import get_lockfile_path
+    from ..deps.lockfile_guard import enforce_or_exit
+
+    scope = InstallScope.USER if global_ else InstallScope.PROJECT
+    enforce_or_exit(
+        get_lockfile_path(get_apm_dir(scope)),
+        error=logger.error,
+        warn=logger.warning,
+        dry_run=dry_run,
+    )
+
+
 def _handle_mcp_install(  # noqa: PLR0913
     *,
     mcp_name,
@@ -1228,6 +1257,11 @@ def install(  # noqa: C901, PLR0913
 
             legacy_skill_paths = should_use_legacy_skill_paths()
 
+        # #2334: a CLI older than the lockfile's generator must not rewrite it.
+        # This sits ABOVE the local-bundle and --mcp branches below -- see
+        # _guard_lockfile_generator for why that placement is load-bearing.
+        _guard_lockfile_generator(global_=global_, dry_run=dry_run, logger=logger)
+
         # ----------------------------------------------------------------
         # Local bundles bypass dependency resolution and do not mutate apm.yml.
         # ----------------------------------------------------------------
@@ -1430,13 +1464,8 @@ def install(  # noqa: C901, PLR0913
         manifest_path = get_manifest_path(scope)
         apm_dir = get_apm_dir(scope)
 
-        # #2334: a CLI older than the lockfile's generator must not rewrite it.
-        # Checked here, before any download, deployment, or manifest write, so a
-        # refusal leaves the project byte-for-byte unchanged.
-        from ..deps.lockfile import get_lockfile_path as _get_lockfile_path
-        from ..deps.lockfile_guard import enforce_or_exit as _enforce_lockfile_generator
-
-        _enforce_lockfile_generator(_get_lockfile_path(apm_dir), error=logger.error)
+        # The #2334 generator guard already ran above, before the local-bundle
+        # and --mcp branches that return without reaching this point.
 
         # Display name for messages (short for project scope, full for user scope)
         manifest_display = str(manifest_path) if scope is InstallScope.USER else APM_YML_FILENAME

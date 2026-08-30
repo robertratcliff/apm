@@ -102,10 +102,16 @@ def prune(ctx, dry_run):
         apm_modules_dir = Path(APM_MODULES_DIR)
 
         # #2334: refuse before any analysis or removal when this CLI predates
-        # the lockfile's generator.
+        # the lockfile's generator. --dry-run writes nothing, so it warns and
+        # continues rather than refusing.
         from ..deps.lockfile_guard import enforce_or_exit as _enforce_lockfile_generator
 
-        _enforce_lockfile_generator(get_lockfile_path(Path.cwd()), error=logger.error)
+        _enforce_lockfile_generator(
+            get_lockfile_path(Path.cwd()),
+            error=logger.error,
+            warn=logger.warning,
+            dry_run=dry_run,
+        )
 
         logger.start("Analyzing installed packages vs apm.yml...")
 

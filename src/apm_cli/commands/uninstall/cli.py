@@ -113,7 +113,12 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
         from ...deps.lockfile_guard import enforce_or_exit as _enforce_lockfile_generator
 
         lockfile_path = get_lockfile_path(apm_dir)
-        _enforce_lockfile_generator(lockfile_path, error=logger.error)
+        _enforce_lockfile_generator(
+            lockfile_path,
+            error=logger.error,
+            warn=logger.warning,
+            dry_run=dry_run,
+        )
 
         if scope is InstallScope.USER:
             logger.progress("Uninstalling from user scope (~/.apm/)")

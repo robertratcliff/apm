@@ -136,7 +136,7 @@ deployments:
 |---|---|---|---|
 | `lockfile_version` | string | yes | Schema version. `"1"` for plain Git projects; `"2"` when any dependency has `source: "registry"` or Git semver resolution fields (`constraint`, `resolved_tag`, `resolved_at`). |
 | `generated_at` | ISO 8601 string | yes | UTC timestamp of the last write. Ignored by equivalence checks. |
-| `apm_version` | string | no | APM CLI version that wrote the file. Diagnostic only. |
+| `apm_version` | string | no | APM CLI version that wrote the file. Read by the [generator guard](#generator-compatibility-guard) before any mutating command, and ignored by equivalence checks. The literal `unknown` is written when the running distribution cannot report its own version, and is treated as absent. |
 | `dependencies` | list | yes | Resolved APM packages. See [per-entry fields](#per-entry-fields). |
 | `mcp_servers` | list of strings | no | Names of MCP servers managed as of the last install or update, including transitively contributed servers. |
 | `mcp_configs` | map | no | `server_name -> resolved config dict` baseline used to detect MCP drift. |
@@ -325,11 +325,41 @@ shipped.
 | `apm audit` | yes | no |
 | `apm prune` | yes (orphans and `deployments` ownership, even with nothing else to prune) | yes (after removing orphans and reconciling `deployments`) |
 | `apm view --lock` | yes | no |
-| `apm unpack` | bundle's pack-enriched lockfile | merges into project lockfile |
+| `apm unpack` | bundle's pack-enriched lockfile | no; it deploys the bundle's files and leaves the project lockfile alone |
+| `apm lock` | existing lockfile | full rewrite |
+| `apm lock export` | yes | no |
+| `apm update` | yes | yes (after re-resolution) |
+| `apm uninstall` | yes | yes (after reconciling removed packages) |
 
 `apm install` only rewrites the file when its semantic content changes
 (`generated_at` and `apm_version` are ignored when comparing). A no-op install
 leaves the file untouched.
+
+## Generator compatibility guard
+
+An APM older than the one that wrote the lockfile must not rewrite it: the
+older CLI does not understand fields introduced since, and would drop them
+without warning. Before doing any work, every command in the table above that
+writes the lockfile compares its own version against the recorded
+`apm_version` and refuses when it is the older of the two. The refusal happens
+before any download, deployment or manifest write, so the project is left
+byte-for-byte unchanged, and it is reported distinctly from a schema or
+integrity failure.
+
+Three cases are deliberately **not** refused:
+
+- **No `apm_version` recorded** — a first install, or a lockfile predating the
+  field. There is nothing to compare against.
+- **`apm_version: unknown`** — APM writes this itself when the running
+  distribution cannot report its version, so refusing it would reject
+  lockfiles APM produced. If the *running* CLI cannot report a comparable
+  version, the command warns and continues rather than refusing; check
+  `apm --version` against the recorded generator before committing the result.
+- **`--dry-run`** — writes nothing, so it warns and completes, which is how you
+  see what the real command would have done.
+
+Read-only commands (`apm audit`, `apm outdated`, `apm list`, `apm view`,
+`apm compile`, `apm lock export`, ...) are never blocked by this guard.
 
 ## Drift and integrity
 

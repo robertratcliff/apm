@@ -18,6 +18,22 @@ Version comparison here is intentionally NOT
 cannot parse, which is the right default for a notifier and precisely the
 wrong one for a guard.  It also orders prereleases lexicographically, making
 ``a10`` sort below ``a9``.
+
+Two asymmetries are deliberate:
+
+* **Unrecognizable RECORDED metadata is fatal**; an unrecognizable RUNNING
+  version is not.  A lockfile we cannot read is a reason to stop, but a CLI
+  that cannot introspect its own version is a property of how APM was
+  packaged, not of the user's project.  PyInstaller binaries carry no
+  distribution metadata, so :func:`running_cli_version` resolves through
+  :func:`apm_cli.version.get_version` (build-time constant, then distribution
+  metadata, then ``pyproject.toml``) and a residual failure degrades to
+  :class:`UndeterminableRunningVersionError`, which callers surface as a
+  warning rather than a refusal.  Blocking every mutating command on those
+  builds would be a worse regression than the one this guard prevents.
+* **``--dry-run`` warns instead of refusing.**  A dry run writes nothing, and
+  it is the one command a blocked user reaches for to understand what would
+  happen.  See ``dry_run`` on :func:`enforce_or_exit`.
 """
 
 from __future__ import annotations
@@ -27,21 +43,51 @@ from collections.abc import Callable
 from pathlib import Path
 
 # APM's own sentinel for "the running distribution could not identify itself"
-# (see ``apm_cli.deps.lockfile.installed_apm_version``).  APM writes this into
-# real lockfiles, so it must be treated as absent metadata rather than as
-# corruption -- refusing it would brick lockfiles APM itself produced.
+# (see ``apm_cli.deps.lockfile.installed_apm_version`` and
+# ``apm_cli.version.get_version``).  APM writes this into real lockfiles, so
+# it must be treated as absent metadata rather than as corruption -- refusing
+# it would brick lockfiles APM itself produced.
 UNKNOWN_VERSION = "unknown"
 
-# Accepted release forms: stable, plus the aN/bN/rcN prereleases APM ships.
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?$")
+# Supported grammar (a pragmatic PEP 440 subset covering everything APM has
+# released or can build):
+#
+#     N.N.N[<sep>(a|alpha|b|beta|rc|c)N][<sep>postN][<sep>devN][+local]
+#
+# where <sep> is an optional ``.``, ``-`` or ``_``.  Anything outside this --
+# an epoch (``1!2.0.0``), a four-segment release, a bare ``1.2``, a ``v``
+# prefix (APM tags carry one, recorded apm_version never does) -- returns
+# ``None`` and is handled per the recorded/running asymmetry documented above.
+_VERSION_RE = re.compile(
+    r"""^
+    (\d+)\.(\d+)\.(\d+)
+    (?:[._-]?(a|alpha|b|beta|rc|c)\.?(\d+))?
+    (?:[._-]?post\.?(\d+))?
+    (?:[._-]?dev\.?(\d+))?
+    $""",
+    re.VERBOSE | re.IGNORECASE,
+)
 
-# Prerelease precedence: a < b < rc < stable.
-_PRERELEASE_RANK = {"a": 0, "b": 1, "rc": 2}
+# Prerelease precedence: a < b < rc < stable.  ``alpha``/``beta``/``c`` are
+# alternate PEP 440 spellings of ``a``/``b``/``rc``.
+_PRERELEASE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "rc": 2, "c": 2}
 _STABLE_RANK = 3
+# PEP 440: a bare ``X.Y.Z.devN`` -- no prerelease and no post segment -- is a
+# dev build of the FINAL release, and sorts below every prerelease of it
+# (``1.0.dev1 < 1.0a1.dev1 < 1.0a1 < 1.0``).  Absent-prerelease therefore
+# sorts lowest in that one case and highest in every other.
+_PRE_DEV_OF_FINAL_RANK = -1
+
+# A ``.devN`` build precedes the release it builds toward, so absent-dev must
+# sort ABOVE any dev number at the same release level.
+_DEV_PRESENT = 0
+_DEV_ABSENT = 1
 
 # Only a key at column 0 is the top-level generator field.  Anything indented
 # belongs to a nested mapping and is not the field this guard governs.
 _TOP_LEVEL_APM_VERSION_RE = re.compile(r"^apm_version[ \t]*:", re.MULTILINE)
+
+VersionKey = tuple[int, int, int, int, int, int, int, int]
 
 
 class LockfileGeneratorError(Exception):
@@ -76,12 +122,36 @@ class UnsafeGeneratorMetadataError(LockfileGeneratorError):
         )
 
 
-def parse_version(raw: object) -> tuple[int, int, int, int, int] | None:
+class UndeterminableRunningVersionError(LockfileGeneratorError):
+    """This build of APM cannot report a version comparable to the lockfile's.
+
+    Advisory, not fatal.  Raised when the lockfile names a specific generator
+    but the running CLI cannot identify itself -- a property of how APM was
+    packaged, not of the user's project.  :func:`enforce_or_exit` renders this
+    as a warning and continues.
+    """
+
+    def __init__(self, running: str, recorded: str) -> None:
+        self.running = running
+        self.recorded = recorded
+        super().__init__(
+            f"This build of APM reports its version as {running!r}, so it cannot be "
+            f"compared against the lockfile's recorded generator {recorded}.\n"
+            f"Continuing anyway. If this APM is older than {recorded}, this command "
+            f"may drop lockfile data it does not understand -- check 'apm --version' "
+            f"against the recorded generator before committing apm.lock.yaml."
+        )
+
+
+def parse_version(raw: object) -> VersionKey | None:
     """Return an orderable key for *raw*, or ``None`` when it is not a version.
 
     Build metadata (``+local``) is stripped before comparison so it never
-    affects precedence.  The prerelease number is compared numerically, so
-    ``0.1.0a9`` correctly precedes ``0.1.0a10``.
+    affects precedence.  Numeric segments compare numerically, so ``0.1.0a9``
+    correctly precedes ``0.1.0a10``.  Ordering across suffixes follows
+    PEP 440::
+
+        0.25.0.dev1 < 0.25.0a1 < 0.25.0b1 < 0.25.0rc1 < 0.25.0 < 0.25.0.post1
     """
     if not isinstance(raw, str):
         return None
@@ -90,16 +160,51 @@ def parse_version(raw: object) -> tuple[int, int, int, int, int] | None:
     match = _VERSION_RE.match(text)
     if not match:
         return None
-    major, minor, patch, prerelease, prerelease_num = match.groups()
-    if prerelease is None:
-        return (int(major), int(minor), int(patch), _STABLE_RANK, 0)
+    major, minor, patch, prerelease, prerelease_num, post_num, dev_num = match.groups()
+    if prerelease is not None:
+        pre_rank = _PRERELEASE_RANK[prerelease.lower()]
+        pre_num = int(prerelease_num)
+    elif post_num is None and dev_num is not None:
+        # A dev build of the final release; see _PRE_DEV_OF_FINAL_RANK.
+        pre_rank, pre_num = _PRE_DEV_OF_FINAL_RANK, 0
+    else:
+        pre_rank, pre_num = _STABLE_RANK, 0
     return (
         int(major),
         int(minor),
         int(patch),
-        _PRERELEASE_RANK[prerelease],
-        int(prerelease_num),
+        pre_rank,
+        pre_num,
+        int(post_num or 0),
+        _DEV_ABSENT if dev_num is None else _DEV_PRESENT,
+        int(dev_num or 0),
     )
+
+
+def running_cli_version() -> str:
+    """Return the running CLI's version, or ``UNKNOWN_VERSION``.
+
+    Prefers :func:`apm_cli.version.get_version`, which consults the
+    PyInstaller build-time constant first and falls back to distribution
+    metadata and then ``pyproject.toml``.  ``installed_apm_version`` -- which
+    only ever asks ``importlib.metadata`` -- is the last resort: it is what
+    stamps the lockfile, but it reports ``unknown`` from a frozen binary,
+    where no distribution metadata is shipped.
+
+    This is the single seam to patch when simulating a given CLI version.
+    """
+    try:
+        from ..version import get_version
+
+        candidate = get_version()
+    except Exception:  # pragma: no cover - defensive; get_version swallows its own
+        candidate = None
+    if isinstance(candidate, str) and candidate and candidate != UNKNOWN_VERSION:
+        return candidate
+
+    from .lockfile import installed_apm_version
+
+    return installed_apm_version()
 
 
 def read_recorded_generator(lockfile_path: Path) -> str | None:
@@ -156,8 +261,10 @@ def require_compatible_lockfile_generator(
     Raises:
         StaleCliError: The running CLI is strictly older than the generator.
         UnsafeGeneratorMetadataError: The recorded metadata is duplicated or
-            malformed, or the running CLI cannot identify its own version
-            while the lockfile names a specific generator.
+            malformed.
+        UndeterminableRunningVersionError: The lockfile names a specific
+            generator but this build of APM cannot report a comparable
+            version.  Advisory -- see the class docstring.
     """
     recorded_raw = read_recorded_generator(lockfile_path)
     if recorded_raw is None or recorded_raw == UNKNOWN_VERSION:
@@ -170,18 +277,11 @@ def require_compatible_lockfile_generator(
         )
 
     if running_version is None:
-        from .lockfile import installed_apm_version
-
-        running_version = installed_apm_version()
+        running_version = running_cli_version()
 
     running = parse_version(running_version)
     if running is None:
-        # The lockfile names a specific generator we cannot compare against,
-        # so we cannot prove this CLI is not the older one.
-        raise UnsafeGeneratorMetadataError(
-            f"the running APM reports version {running_version!r}, which cannot "
-            f"be compared against the recorded generator {recorded_raw!r}"
-        )
+        raise UndeterminableRunningVersionError(running_version, recorded_raw)
 
     if running < recorded:
         from ..update_policy import get_update_hint_message
@@ -193,6 +293,8 @@ def enforce_or_exit(
     lockfile_path: Path,
     *,
     error: Callable[[str], object],
+    warn: Callable[[str], object] | None = None,
+    dry_run: bool = False,
     running_version: str | None = None,
 ) -> None:
     """Guard *lockfile_path*, rendering any refusal through *error* and exiting 1.
@@ -200,18 +302,33 @@ def enforce_or_exit(
     The CLI-facing wrapper around
     :func:`require_compatible_lockfile_generator`.  *error* is the calling
     command's own error renderer (``logger.error``, ``_rich_error``, ...), so
-    this stays free of any presentation-layer import.
+    this stays free of any presentation-layer import.  *warn* is the matching
+    warning renderer; it falls back to *error* when the caller has none.
 
     Call it at the top of a mutating command, before the command does any
     work, so a refusal leaves the project untouched.
+
+    Args:
+        dry_run: When true, a refusal is downgraded to a warning and the
+            command continues.  ``--dry-run`` writes nothing, and it is what a
+            blocked user runs to find out what the real command would do;
+            refusing it removes that diagnostic for no protective benefit.
     """
     import sys
+
+    render_warning = warn if warn is not None else error
 
     try:
         require_compatible_lockfile_generator(
             lockfile_path,
             running_version=running_version,
         )
+    except UndeterminableRunningVersionError as exc:
+        # Advisory only: this build cannot introspect its own version.
+        render_warning(str(exc))
     except LockfileGeneratorError as exc:
+        if dry_run:
+            render_warning(f"{exc}\n(--dry-run writes nothing, so this run continues.)")
+            return
         error(str(exc))
         sys.exit(1)

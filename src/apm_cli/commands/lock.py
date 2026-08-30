@@ -56,6 +56,7 @@ from ..utils.console import (
     _rich_error,
     _rich_info,
     _rich_success,
+    _rich_warning,
 )
 from ._helpers import _find_apm_yml
 
@@ -212,11 +213,16 @@ def _run_lock(
         os.chdir(project_root)
 
     # #2334: refuse before resolving anything when this CLI predates the
-    # lockfile's generator.
+    # lockfile's generator. ``apm lock`` has no --dry-run, and ``apm lock
+    # export`` is read-only and never reaches here.
     from apm_cli.deps.lockfile import get_lockfile_path as _get_lockfile_path
     from apm_cli.deps.lockfile_guard import enforce_or_exit as _enforce_lockfile_generator
 
-    _enforce_lockfile_generator(_get_lockfile_path(project_root), error=_rich_error)
+    _enforce_lockfile_generator(
+        _get_lockfile_path(project_root),
+        error=_rich_error,
+        warn=_rich_warning,
+    )
 
     try:
         apm_package = APMPackage.from_apm_yml(Path("apm.yml"))
