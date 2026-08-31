@@ -846,3 +846,67 @@ class TestExecutableTrustDriftCheck:
         assert check.passed is False
         assert check.informational is True
         assert "apm policy explain hook-pkg" in check.detail
+
+
+# ---------------------------------------------------------------------------
+# Check registry: one broken check must not kill the report
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorFaultIsolation:
+    @patch("apm_cli.commands.marketplace.doctor.subprocess.run")
+    def test_advisory_check_exception_is_reported_not_raised(
+        self, mock_run, runner, tmp_path, monkeypatch
+    ):
+        from apm_cli.commands.marketplace import doctor as doctor_mod
+
+        def _boom(run):
+            raise RuntimeError("policy store unreadable")
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            doctor_mod,
+            "_CHECK_REGISTRY",
+            (
+                ("git", True, doctor_mod._check_git),
+                ("network", True, doctor_mod._check_network),
+                ("executable trust", False, _boom),
+            ),
+        )
+        mock_run.side_effect = [
+            _make_run_result(0, stdout="git version 2.40.0"),
+            _make_run_result(0),
+        ]
+
+        result = runner.invoke(cli, ["doctor"])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "Check failed" in result.output
+        assert "RuntimeError" in result.output
+
+    @patch("apm_cli.commands.marketplace.doctor.subprocess.run")
+    def test_critical_check_exception_still_fails_the_run(
+        self, mock_run, runner, tmp_path, monkeypatch
+    ):
+        from apm_cli.commands.marketplace import doctor as doctor_mod
+
+        def _boom(run):
+            raise RuntimeError("git probe exploded")
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(doctor_mod, "_CHECK_REGISTRY", (("git", True, _boom),))
+
+        result = runner.invoke(cli, ["doctor"])
+        assert not isinstance(result.exception, RuntimeError)
+        assert result.exit_code == 1
+        assert "Check failed" in result.output
+
+    @patch("apm_cli.commands.marketplace.doctor.subprocess.run")
+    def test_registry_criticality_matches_exit_code_contract(
+        self, mock_run, runner, tmp_path, monkeypatch
+    ):
+        """Only git and network may drive a non-zero exit code."""
+        from apm_cli.commands.marketplace.doctor import _CHECK_REGISTRY
+
+        critical = {name for name, is_critical, _ in _CHECK_REGISTRY if is_critical}
+        assert critical == {"git", "network"}
