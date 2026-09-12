@@ -54,6 +54,7 @@ from apm_cli.commands.self_update import self_update
 from apm_cli.commands.targets import targets
 from apm_cli.commands.uninstall import uninstall
 from apm_cli.commands.update import update
+from apm_cli.commands.validate import validate
 from apm_cli.commands.view import view as view_cmd
 
 _CLI_EPILOG = (
@@ -226,6 +227,7 @@ cli.add_command(mcp)
 cli.add_command(policy)
 cli.add_command(outdated_cmd, name="outdated")
 cli.add_command(doctor)
+cli.add_command(validate)
 cli.add_command(lifecycle)
 cli.add_command(marketplace)
 cli.add_command(find_cmd)
