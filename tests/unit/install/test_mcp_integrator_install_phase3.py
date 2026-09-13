@@ -21,6 +21,7 @@ Covers branches not hit by existing MCP tests:
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -296,7 +297,7 @@ class TestRunMcpInstallNoTargetRuntimes:
 
 
 class TestRunMcpInstallSelfDefined:
-    def test_self_defined_dep_separated_correctly(self) -> None:
+    def test_self_defined_dep_separated_correctly(self, tmp_path: Path) -> None:
         from apm_cli.integration.mcp_integrator_install import run_mcp_install
 
         sd_dep = _make_self_defined_dep("my-server")
@@ -304,8 +305,10 @@ class TestRunMcpInstallSelfDefined:
 
         # We only care that a self_defined dep is recognized and processed
         # The actual install path will raise in unit context; that's OK.
+        # project_root is pinned to tmp_path so the partial .github/mcp.json
+        # written before that exception lands in the tmp dir, not the repo.
         with contextlib.suppress(Exception):
-            run_mcp_install([sd_dep], runtime="copilot", logger=logger)
+            run_mcp_install([sd_dep], runtime="copilot", project_root=tmp_path, logger=logger)
 
         # Function reached without crash is the assertion
 
